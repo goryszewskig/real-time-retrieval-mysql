@@ -1,0 +1,5 @@
+kafka-python
+opensearch-py
+qdrant-client
+psycopg2-binary
+pytest
