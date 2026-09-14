@@ -9,7 +9,7 @@
 #                                         # consumer group - Kafka
 #                                         # splits the topic's
 #                                         # partitions across them.
-#                                         # usersdb.public.users has
+#                                         # usersdb.usersdb.users has
 #                                         # 3 partitions, so 3 is the
 #                                         # natural ceiling here.
 

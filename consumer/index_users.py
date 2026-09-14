@@ -2,12 +2,9 @@ import json
 import os
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
 
-import httpx
+import pymysql
 from kafka import KafkaConsumer
-from opensearchpy import OpenSearch
-from qdrant_client import QdrantClient, models
 
 
 # ============================================================
@@ -16,12 +13,12 @@ from qdrant_client import QdrantClient, models
 
 KAFKA_BOOTSTRAP_SERVERS = os.getenv(
     "KAFKA_BOOTSTRAP_SERVERS",
-    "localhost:9092",
+    "localhost:9094",
 )
 
 KAFKA_TOPIC = os.getenv(
     "KAFKA_TOPIC",
-    "usersdb.public.users",
+    "usersdb.usersdb.users",
 )
 
 KAFKA_GROUP_ID = os.getenv(
@@ -35,17 +32,12 @@ KAFKA_GROUP_ID = os.getenv(
 # logs and in broker-side client listings.
 CONSUMER_INSTANCE_ID = os.getenv("CONSUMER_INSTANCE_ID", "0")
 
-OPENSEARCH_HOST = os.environ["OPENSEARCH_HOST"]
-OPENSEARCH_USERNAME = os.environ["OPENSEARCH_USERNAME"]
-OPENSEARCH_PASSWORD = os.environ["OPENSEARCH_PASSWORD"]
-
-OPENSEARCH_INDEX = "users"
-
-QDRANT_URL = os.environ["QDRANT_URL"]
-QDRANT_API_KEY = os.environ["QDRANT_API_KEY"]
-QDRANT_COLLECTION = "users_semantic"
-
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+# Destination MySQL (searchdb on mysql-dest).
+MYSQL_DEST_HOST = os.getenv("MYSQL_DEST_HOST", "localhost")
+MYSQL_DEST_PORT = int(os.getenv("MYSQL_DEST_PORT", "3307"))
+MYSQL_DEST_DB = os.getenv("MYSQL_DEST_DB", "searchdb")
+MYSQL_DEST_USER = os.environ["MYSQL_DEST_USER"]
+MYSQL_DEST_PASSWORD = os.environ["MYSQL_DEST_PASSWORD"]
 
 CDC_TIMINGS_LOG = os.getenv(
     "CDC_TIMINGS_LOG",
@@ -54,73 +46,39 @@ CDC_TIMINGS_LOG = os.getenv(
 
 
 # ============================================================
-# Clients
-# ============================================================
-
-opensearch = OpenSearch(
-    hosts=[
-        {
-            "host": OPENSEARCH_HOST,
-            "port": 443,
-        }
-    ],
-    http_auth=(
-        OPENSEARCH_USERNAME,
-        OPENSEARCH_PASSWORD,
-    ),
-    use_ssl=True,
-    verify_certs=True,
-)
-
-qdrant = QdrantClient(
-    url=QDRANT_URL,
-    api_key=QDRANT_API_KEY,
-    cloud_inference=True,
-)
-
-
-# ============================================================
-# Qdrant server-side timing capture
+# Destination MySQL connection
 #
-# The high-level qdrant-client response objects don't expose the
-# raw REST envelope's "time" field (server-side embedding + HNSW
-# time, in seconds), so it's captured here via an httpx response
-# hook instead of hand-rolling the request ourselves.
+# Only one message is processed at a time in this process, so a
+# single connection is enough (PyMySQL connections are not
+# thread-safe anyway). autocommit=True: every upsert/delete is its
+# own transaction, committed before we commit the Kafka offset.
 # ============================================================
 
-_qdrant_last_server_ms = {"value": None}
-
-_original_httpx_send = httpx.Client.send
-
-
-def _capture_qdrant_timing(self, request, *args, **kwargs):
-    response = _original_httpx_send(self, request, *args, **kwargs)
-
-    if "/points" in str(request.url):
-        try:
-            body = json.loads(response.read())
-            _qdrant_last_server_ms["value"] = (
-                body.get("time", 0) * 1000
-            )
-        except Exception:
-            _qdrant_last_server_ms["value"] = None
-
-    return response
+def create_mysql_connection():
+    return pymysql.connect(
+        host=MYSQL_DEST_HOST,
+        port=MYSQL_DEST_PORT,
+        user=MYSQL_DEST_USER,
+        password=MYSQL_DEST_PASSWORD,
+        database=MYSQL_DEST_DB,
+        autocommit=True,
+    )
 
 
-httpx.Client.send = _capture_qdrant_timing
+mysql_conn = create_mysql_connection()
 
 
-# OpenSearch and Qdrant writes are independent of each other, so
-# they run concurrently rather than one after another. Only one
-# message is processed at a time, so at most one opensearch call
-# and one qdrant call are ever in flight together (never two of
-# the same kind at once) - see index_qdrant's use of
-# _qdrant_last_server_ms above for why that matters.
-_write_executor = ThreadPoolExecutor(
-    max_workers=2,
-    thread_name_prefix="cdc-write",
-)
+def get_connection():
+    """Return a live connection, reconnecting if it dropped."""
+
+    global mysql_conn
+
+    try:
+        mysql_conn.ping()
+    except Exception:
+        mysql_conn = create_mysql_connection()
+
+    return mysql_conn
 
 
 # ============================================================
@@ -151,92 +109,59 @@ consumer = KafkaConsumer(
 # Helpers
 # ============================================================
 
-def build_search_text(user):
-    """
-    Build the semantic representation of a user.
-
-    Keep this consistent with the original Qdrant
-    indexing script.
-    """
-
-    fields = [
-        user.get("name"),
-        user.get("job_title"),
-        user.get("company"),
-        user.get("location"),
-        user.get("skills"),
-        user.get("bio"),
-    ]
-
-    return " ".join(
-        str(value)
-        for value in fields
-        if value
+UPSERT_SQL = """
+    INSERT INTO users (
+        id, name, email, company, job_title, location,
+        skills, bio, experience, created_at, updated_at
     )
+    VALUES (
+        %(id)s, %(name)s, %(email)s, %(company)s, %(job_title)s,
+        %(location)s, %(skills)s, %(bio)s, %(experience)s,
+        %(created_at)s, %(updated_at)s
+    ) AS new
+    ON DUPLICATE KEY UPDATE
+        name = new.name,
+        email = new.email,
+        company = new.company,
+        job_title = new.job_title,
+        location = new.location,
+        skills = new.skills,
+        bio = new.bio,
+        experience = new.experience,
+        created_at = new.created_at,
+        updated_at = new.updated_at
+"""
 
 
-def index_opensearch(user):
+def micros_to_datetime(epoch_micros):
     """
-    Upsert the PostgreSQL row into OpenSearch.
-
-    PostgreSQL users.id is deliberately used as the
-    OpenSearch document ID.
-
-    Uses the Bulk API (for a single document) rather than the
-    plain Index API, because only Bulk responses include a
-    "took" field (server-side indexing time, ms) - the signal
-    used to split network overhead from actual indexing time.
-    """
-
-    document_id = str(user["id"])
-
-    total_start = time.perf_counter()
-
-    print(OPENSEARCH_INDEX, document_id, user)
-
-    response = opensearch.bulk(
-        body=[
-            {
-                "index": {
-                    "_index": OPENSEARCH_INDEX,
-                    "_id": document_id,
-                }
-            },
-            user,
-        ],
-        refresh=False,
-    )
-
-    total_ms = (time.perf_counter() - total_start) * 1000
-    server_ms = response.get("took")
-
-    print(
-        f"[OpenSearch] upserted user={document_id}"
-    )
-
-    return {
-        "total_ms": total_ms,
-        "server_ms": server_ms,
-        "network_ms": (
-            (total_ms - server_ms)
-            if server_ms is not None
-            else None
-        ),
-    }
-
-
-def index_qdrant(user):
-    """
-    Generate the embedding and upsert the point into Qdrant.
-
-    PostgreSQL users.id is used as the Qdrant point ID.
+    Debezium's wire representation for a MySQL DATETIME(6) column is
+    epoch MICROSECONDS as a number (io.debezium.time.MicroTimestamp).
+    Convert it to a datetime for PyMySQL.
     """
 
-    document_id = int(user["id"])
+    if epoch_micros is None:
+        return None
 
-    text = build_search_text(user)
+    from datetime import datetime, timezone
 
-    payload = {
+    return datetime.fromtimestamp(
+        epoch_micros / 1_000_000,
+        tz=timezone.utc,
+    ).replace(tzinfo=None)
+
+
+def index_mysql(user):
+    """
+    Upsert the source row into the destination MySQL users table.
+
+    The source users.id is deliberately used as the primary key, so
+    the upsert is idempotent - safe under at-least-once redelivery.
+    """
+
+    document_id = user["id"]
+
+    row = {
         "id": document_id,
         "name": user.get("name"),
         "email": user.get("email"),
@@ -246,43 +171,25 @@ def index_qdrant(user):
         "skills": user.get("skills"),
         "bio": user.get("bio"),
         "experience": user.get("experience"),
-        "created_at": user.get("created_at"),
-        "updated_at": user.get("updated_at"),
+        "created_at": micros_to_datetime(user.get("created_at")),
+        "updated_at": micros_to_datetime(user.get("updated_at")),
     }
-
-    _qdrant_last_server_ms["value"] = None
 
     total_start = time.perf_counter()
 
-    qdrant.upsert(
-        collection_name=QDRANT_COLLECTION,
-        points=[
-            models.PointStruct(
-                id=document_id,
-                vector=models.Document(
-                    text=text,
-                    model=EMBEDDING_MODEL,
-                ),
-                payload=payload,
-            )
-        ],
-    )
+    connection = get_connection()
+
+    with connection.cursor() as cursor:
+        cursor.execute(UPSERT_SQL, row)
 
     total_ms = (time.perf_counter() - total_start) * 1000
-    server_ms = _qdrant_last_server_ms["value"]
 
     print(
-        f"[Qdrant] upserted user={document_id}"
+        f"[MySQL] upserted user={document_id}"
     )
 
     return {
         "total_ms": total_ms,
-        "server_ms": server_ms,
-        "network_ms": (
-            (total_ms - server_ms)
-            if server_ms is not None
-            else None
-        ),
     }
 
 
@@ -311,27 +218,19 @@ def log_timing(record):
 
 def delete_user(user_id):
     """
-    Delete the user from both derived indexes.
+    Delete the user from the destination table.
     """
 
-    document_id = str(user_id)
+    connection = get_connection()
 
-    opensearch.delete(
-        index=OPENSEARCH_INDEX,
-        id=document_id,
-        ignore=[404],
-        refresh=False,
-    )
-
-    qdrant.delete(
-        collection_name=QDRANT_COLLECTION,
-        points_selector=models.PointIdsList(
-            points=[int(user_id)]
-        ),
-    )
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM users WHERE id = %s",
+            (user_id,),
+        )
 
     print(
-        f"[DELETE] user={document_id}"
+        f"[DELETE] user={user_id}"
     )
 
 
@@ -341,7 +240,7 @@ def delete_user(user_id):
 
 def process_event(event):
     """
-    Debezium PostgreSQL event structure:
+    Debezium MySQL event structure:
 
     {
         "before": {...},
@@ -390,17 +289,7 @@ def process_event(event):
             )
             return
 
-        opensearch_future = _write_executor.submit(
-            index_opensearch, user
-        )
-        qdrant_future = _write_executor.submit(
-            index_qdrant, user
-        )
-
-        wait([opensearch_future, qdrant_future])
-
-        opensearch_timing = opensearch_future.result()
-        qdrant_timing = qdrant_future.result()
+        mysql_timing = index_mysql(user)
 
         log_timing(
             {
@@ -408,12 +297,7 @@ def process_event(event):
                 "op": operation,
                 "db_to_debezium_ms": db_to_debezium_ms,
                 "kafka_to_consumer_ms": kafka_to_consumer_ms,
-                "opensearch_total_ms": opensearch_timing["total_ms"],
-                "opensearch_server_ms": opensearch_timing["server_ms"],
-                "opensearch_network_ms": opensearch_timing["network_ms"],
-                "qdrant_total_ms": qdrant_timing["total_ms"],
-                "qdrant_server_ms": qdrant_timing["server_ms"],
-                "qdrant_network_ms": qdrant_timing["network_ms"],
+                "mysql_total_ms": mysql_timing["total_ms"],
                 "processed_at_ms": received_at_ms,
             }
         )
@@ -467,7 +351,7 @@ def main():
 
             process_event(event)
 
-            # Commit ONLY after both indexes succeeded.
+            # Commit ONLY after the destination write succeeded.
             consumer.commit()
 
             print(

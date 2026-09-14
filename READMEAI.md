@@ -1,6 +1,23 @@
-# Repo Analysis — real-time-retrieval
+# Repo Analysis — real-time-retrieval (MySQL variant)
 
-Analyzed: 2026-09-13. Single commit (`62eb47c`); no AGENTS.md, no tests, no CI.
+Analyzed: 2026-09-13 (original); updated 2026-09-14 after the MySQL migration.
+
+> **2026-09-14 update:** the pipeline was migrated end-to-end to MySQL 8.0 and
+> published as a separate repo (`real-time-retrieval-mysql`). Source: MySQL 8.0
+> binlog via Debezium `MySqlConnector` (`snapshot.mode: initial`). Destination:
+> a second MySQL 8.0 instance with a FULLTEXT index (replacing OpenSearch +
+> Qdrant; MySQL 8.0 has no vector type, so the semantic leg was dropped).
+> Query layer: `MATCH ... AGAINST ... IN NATURAL LANGUAGE MODE`. Benchmarks now
+> use PyMySQL (`UPDATE` + follow-up `SELECT` instead of Postgres `RETURNING`).
+> New: `kafka/mysql/{source-init,dest-init}/01-init.sql` (schema, users,
+> FULLTEXT index) and `scripts/seed_source.py` (CSV loader). Verified E2E on
+> 2026-09-14: 10K-row snapshot replicated, UPDATE/DELETE CDC round-trips,
+> FULLTEXT query, and both benchmarks (write: 51/51 replicated with stage
+> breakdown; read: 51/51 queries, 0 errors).
+
+## Original analysis (PostgreSQL → OpenSearch + Qdrant)
+
+Single commit (`62eb47c`); no AGENTS.md, no tests, no CI.
 
 ## What this is
 

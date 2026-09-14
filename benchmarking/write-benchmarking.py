@@ -9,13 +9,9 @@ import statistics
 import sys
 import threading
 import time
-import uuid
-from collections import defaultdict
 from datetime import datetime, timezone
 
-import psycopg2
-from opensearchpy import OpenSearch
-from qdrant_client import QdrantClient
+import pymysql
 
 from load_generator import run_open_loop
 
@@ -27,9 +23,6 @@ from load_generator import run_open_loop
 DEFAULT_RATE = 100
 DEFAULT_DURATION = 60
 DEFAULT_CONCURRENCY = 20
-
-OPENSEARCH_INDEX = "users"
-QDRANT_COLLECTION = "users_semantic"
 
 POLL_INTERVAL_SECONDS = 0.01
 REPLICATION_TIMEOUT_SECONDS = 30
@@ -49,7 +42,7 @@ CDC_TIMINGS_LOG = os.getenv(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Benchmark PostgreSQL write and CDC replication latency."
+        description="Benchmark MySQL write and CDC replication latency."
     )
 
     parser.add_argument(
@@ -68,8 +61,8 @@ def parse_args():
 
     parser.add_argument(
         "--csv",
-        default="users.csv",
-        help="Original 10K users CSV. Default: users.csv",
+        default="data/jobseekers_10000.csv",
+        help="Original 10K users CSV. Default: data/jobseekers_10000.csv",
     )
 
     parser.add_argument(
@@ -101,59 +94,45 @@ def get_env(name):
     return value
 
 
-# PostgreSQL
-PG_HOST = get_env("PGHOST")
-PG_PORT = int(os.getenv("PGPORT", "5432"))
-PG_DATABASE = get_env("PGDATABASE")
-PG_USER = get_env("PGWRITEUSER")
-PG_PASSWORD = get_env("PGWRITEPASSWORD")
+# MySQL source (usersdb) - the benchmark's write user
+MYSQL_SOURCE_HOST = os.getenv("MYSQL_SOURCE_HOST", "localhost")
+MYSQL_SOURCE_PORT = int(os.getenv("MYSQL_SOURCE_PORT", "3306"))
+MYSQL_SOURCE_DB = os.getenv("MYSQL_SOURCE_DB", "usersdb")
+MYSQL_SOURCE_USER = get_env("MYSQL_SOURCE_USER")
+MYSQL_SOURCE_PASSWORD = get_env("MYSQL_SOURCE_PASSWORD")
 
-
-# OpenSearch
-OPENSEARCH_HOST = get_env("OPENSEARCH_HOST")
-OPENSEARCH_USERNAME = get_env("OPENSEARCH_USERNAME")
-OPENSEARCH_PASSWORD = get_env("OPENSEARCH_PASSWORD")
-
-
-# Qdrant
-QDRANT_URL = get_env("QDRANT_URL")
-QDRANT_API_KEY = get_env("QDRANT_API_KEY")
+# MySQL destination (searchdb) - polled by the replication verifier
+MYSQL_DEST_HOST = os.getenv("MYSQL_DEST_HOST", "localhost")
+MYSQL_DEST_PORT = int(os.getenv("MYSQL_DEST_PORT", "3307"))
+MYSQL_DEST_DB = os.getenv("MYSQL_DEST_DB", "searchdb")
+MYSQL_DEST_USER = get_env("MYSQL_DEST_USER")
+MYSQL_DEST_PASSWORD = get_env("MYSQL_DEST_PASSWORD")
 
 
 # ============================================================
-# Clients
+# Connections
 # ============================================================
 
-def create_postgres_connection():
-    return psycopg2.connect(
-        host=PG_HOST,
-        port=PG_PORT,
-        dbname=PG_DATABASE,
-        user=PG_USER,
-        password=PG_PASSWORD,
-        sslmode="require",
+def create_source_connection():
+    return pymysql.connect(
+        host=MYSQL_SOURCE_HOST,
+        port=MYSQL_SOURCE_PORT,
+        user=MYSQL_SOURCE_USER,
+        password=MYSQL_SOURCE_PASSWORD,
+        database=MYSQL_SOURCE_DB,
+        autocommit=False,
     )
 
 
-opensearch = OpenSearch(
-    hosts=[
-        {
-            "host": OPENSEARCH_HOST,
-            "port": 443,
-        }
-    ],
-    http_auth=(
-        OPENSEARCH_USERNAME,
-        OPENSEARCH_PASSWORD,
-    ),
-    use_ssl=True,
-    verify_certs=True,
-)
-
-qdrant = QdrantClient(
-    url=QDRANT_URL,
-    api_key=QDRANT_API_KEY,
-)
+def create_dest_connection():
+    return pymysql.connect(
+        host=MYSQL_DEST_HOST,
+        port=MYSQL_DEST_PORT,
+        user=MYSQL_DEST_USER,
+        password=MYSQL_DEST_PASSWORD,
+        database=MYSQL_DEST_DB,
+        autocommit=True,
+    )
 
 
 # ============================================================
@@ -195,11 +174,8 @@ class BenchmarkState:
 
         self.db_latencies_ms = []
 
-        self.opensearch_replication_ms = []
-        self.qdrant_replication_ms = []
-
-        self.opensearch_timeouts = 0
-        self.qdrant_timeouts = 0
+        self.dest_replication_ms = []
+        self.dest_timeouts = 0
 
         self.pending = {}
 
@@ -209,13 +185,10 @@ class BenchmarkState:
         self.all_target_ids = []
 
         # Stage breakdown, populated from the consumer's timings log
-        # after the run (see read_new_timing_records / main()).
+        # after the run (see collect_stage_timings / main()).
         self.db_to_debezium_ms = []
         self.kafka_to_consumer_ms = []
-        self.opensearch_network_ms = []
-        self.opensearch_server_ms = []
-        self.qdrant_network_ms = []
-        self.qdrant_server_ms = []
+        self.mysql_total_ms = []
 
         self.stop_verifier = False
 
@@ -261,63 +234,71 @@ def now_utc():
 
 
 # ============================================================
-# PostgreSQL update
+# MySQL source update
 # ============================================================
 
-def perform_update(cursor, target_id, source_row):
+def perform_update(connection, target_id, source_row):
     """
-    Update one PostgreSQL user using values selected from
+    Update one MySQL source user using values selected from
     the original 10K CSV.
 
     There is no database trigger on this table, so updated_at
     is set explicitly here rather than relying on one.
 
-    RETURNING updated_at gives us the exact timestamp that
-    PostgreSQL committed for this update.
+    MySQL 8.0 has no RETURNING clause, so the committed
+    updated_at is read back with a follow-up SELECT on the
+    same connection/transaction. NOW(6) keeps microsecond
+    precision so the value can be matched exactly downstream.
     """
 
     start = time.perf_counter()
 
-    cursor.execute(
-        """
-        UPDATE users
-        SET
-            name = %s,
-            email = %s,
-            company = %s,
-            job_title = %s,
-            location = %s,
-            skills = %s,
-            bio = %s,
-            experience = %s,
-            updated_at = NOW()
-        WHERE id = %s
-        RETURNING id, updated_at
-        """,
-        (
-            source_row.get("name"),
-            source_row.get("email"),
-            source_row.get("company"),
-            source_row.get("job_title"),
-            source_row.get("location"),
-            source_row.get("skills"),
-            source_row.get("bio"),
-            int(source_row["experience"])
-            if source_row.get("experience")
-            else None,
-            target_id,
-        ),
-    )
+    with connection.cursor() as cursor:
 
-    result = cursor.fetchone()
-
-    if not result:
-        raise RuntimeError(
-            f"User {target_id} was not found"
+        cursor.execute(
+            """
+            UPDATE users
+            SET
+                name = %s,
+                email = %s,
+                company = %s,
+                job_title = %s,
+                location = %s,
+                skills = %s,
+                bio = %s,
+                experience = %s,
+                updated_at = NOW(6)
+            WHERE id = %s
+            """,
+            (
+                source_row.get("name"),
+                source_row.get("email"),
+                source_row.get("company"),
+                source_row.get("job_title"),
+                source_row.get("location"),
+                source_row.get("skills"),
+                source_row.get("bio"),
+                int(source_row["experience"])
+                if source_row.get("experience")
+                else None,
+                target_id,
+            ),
         )
 
+        if cursor.rowcount == 0:
+            raise RuntimeError(
+                f"User {target_id} was not found"
+            )
+
+        cursor.execute(
+            "SELECT id, updated_at FROM users WHERE id = %s",
+            (target_id,),
+        )
+
+        result = cursor.fetchone()
+
     # Commit is deliberately included in DB latency.
-    cursor.connection.commit()
+    connection.commit()
 
     end = time.perf_counter()
 
@@ -327,20 +308,18 @@ def perform_update(cursor, target_id, source_row):
 
 
 # ============================================================
-# PostgreSQL writer
+# MySQL writer
 # ============================================================
 
-# One (connection, cursor) pair per worker thread - psycopg2
-# connections aren't safe to share across threads. Populated by
-# _init_pg_worker, which run_open_loop's ThreadPoolExecutor calls
-# once per worker thread before it processes any tasks.
-_pg_worker = threading.local()
+# One connection per worker thread - PyMySQL connections aren't
+# safe to share across threads. Populated by _init_mysql_worker,
+# which run_open_loop's ThreadPoolExecutor calls once per worker
+# thread before it processes any tasks.
+_mysql_worker = threading.local()
 
 
-def _init_pg_worker():
-    connection = create_postgres_connection()
-    _pg_worker.connection = connection
-    _pg_worker.cursor = connection.cursor()
+def _init_mysql_worker():
+    _mysql_worker.connection = create_source_connection()
 
 
 def run_writer(csv_rows, rate, duration, concurrency):
@@ -362,7 +341,7 @@ def run_writer(csv_rows, rate, duration, concurrency):
         source_row = random.choice(csv_rows)
 
         return perform_update(
-            _pg_worker.cursor,
+            _mysql_worker.connection,
             target_id,
             source_row,
         )
@@ -370,7 +349,8 @@ def run_writer(csv_rows, rate, duration, concurrency):
     def _on_success(result):
         user_id, updated_at, db_latency_ms = result
 
-        # Convert PostgreSQL timestamp into an epoch timestamp.
+        # Convert the MySQL DATETIME(6) into an epoch timestamp.
+        # The compose MySQL servers run in UTC.
         if updated_at.tzinfo is None:
             updated_at = updated_at.replace(tzinfo=timezone.utc)
 
@@ -405,7 +385,7 @@ def run_writer(csv_rows, rate, duration, concurrency):
         on_success=_on_success,
         on_error=_on_error,
         max_concurrency=concurrency,
-        worker_init=_init_pg_worker,
+        worker_init=_init_mysql_worker,
     )
 
     print()
@@ -420,102 +400,39 @@ def run_writer(csv_rows, rate, duration, concurrency):
 
 
 # ============================================================
-# Timestamp parsing
+# MySQL destination verification
 # ============================================================
 
-def parse_debezium_timestamp(value):
+def check_dest(connection, user_id, expected_updated_at):
     """
-    users.updated_at is a Postgres "timestamp without time zone"
-    column (confirmed via \\d users). Debezium's default wire
-    representation for that type is epoch MICROSECONDS as a
-    number (io.debezium.time.MicroTimestamp) - not an ISO string.
-
-    Some older, separately-seeded documents (loaded outside this
-    CDC pipeline, before it existed) still carry ISO-8601 strings,
-    so both forms are handled here. Returns epoch seconds, or
-    None if the value can't be parsed.
+    True once the destination row's updated_at matches (or has
+    passed) the timestamp the source committed. Both sides store
+    the same DATETIME(6) value, so this is an exact comparison of
+    epoch timestamps.
     """
 
-    if isinstance(value, bool):
-        return None
+    try:
 
-    if isinstance(value, (int, float)):
-        return value / 1_000_000
-
-    if isinstance(value, str):
-        try:
-            parsed = datetime.fromisoformat(
-                value.replace("Z", "+00:00")
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT updated_at FROM users WHERE id = %s",
+                (user_id,),
             )
-        except ValueError:
-            return None
+            row = cursor.fetchone()
 
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-
-        return parsed.timestamp()
-
-    return None
-
-
-# ============================================================
-# OpenSearch verification
-# ============================================================
-
-def check_opensearch(user_id, expected_updated_at):
-    try:
-
-        response = opensearch.get(
-            index=OPENSEARCH_INDEX,
-            id=str(user_id),
-        )
-
-        source = response.get("_source", {})
-
-        actual_updated_at = source.get("updated_at")
-
-        if actual_updated_at is None:
+        if not row or row[0] is None:
             return False
 
-        actual_epoch = parse_debezium_timestamp(actual_updated_at)
+        actual = row[0]
 
-        if actual_epoch is None:
-            return False
+        if isinstance(actual, datetime):
 
-        return actual_epoch >= expected_updated_at
+            if actual.tzinfo is None:
+                actual = actual.replace(tzinfo=timezone.utc)
 
-    except Exception:
-        return False
+            actual_epoch = actual.timestamp()
 
-
-# ============================================================
-# Qdrant verification
-# ============================================================
-
-def check_qdrant(user_id, expected_updated_at):
-    try:
-
-        points = qdrant.retrieve(
-            collection_name=QDRANT_COLLECTION,
-            ids=[int(user_id)],
-            with_payload=True,
-        )
-
-        if not points:
-            return False
-
-        payload = points[0].payload or {}
-
-        actual_updated_at = payload.get(
-            "updated_at"
-        )
-
-        if actual_updated_at is None:
-            return False
-
-        actual_epoch = parse_debezium_timestamp(actual_updated_at)
-
-        if actual_epoch is None:
+        else:
             return False
 
         return actual_epoch >= expected_updated_at
@@ -573,10 +490,7 @@ def collect_stage_timings(start_offset, target_ids):
         for field, bucket in (
             ("db_to_debezium_ms", state.db_to_debezium_ms),
             ("kafka_to_consumer_ms", state.kafka_to_consumer_ms),
-            ("opensearch_network_ms", state.opensearch_network_ms),
-            ("opensearch_server_ms", state.opensearch_server_ms),
-            ("qdrant_network_ms", state.qdrant_network_ms),
-            ("qdrant_server_ms", state.qdrant_server_ms),
+            ("mysql_total_ms", state.mysql_total_ms),
         ):
             value = record.get(field)
 
@@ -591,6 +505,9 @@ def collect_stage_timings(start_offset, target_ids):
 def run_verifier():
 
     print("Replication verifier started")
+
+    # Own connection: the verifier runs on its own thread.
+    connection = create_dest_connection()
 
     while True:
 
@@ -616,12 +533,13 @@ def run_verifier():
             elapsed = now - started_at
 
             # -----------------------------------------------
-            # OpenSearch
+            # MySQL destination
             # -----------------------------------------------
 
-            if not item.get("opensearch_done"):
+            if not item.get("dest_done"):
 
-                if check_opensearch(
+                if check_dest(
+                    connection,
                     user_id,
                     expected_updated_at,
                 ):
@@ -630,45 +548,16 @@ def run_verifier():
 
                     with state.lock:
 
-                        state.opensearch_replication_ms.append(
+                        state.dest_replication_ms.append(
                             latency_ms
                         )
 
                         state.pending[user_id][
-                            "opensearch_done"
+                            "dest_done"
                         ] = True
 
                         print(
-                            f"[OpenSearch] "
-                            f"user={user_id} "
-                            f"replication={latency_ms:.2f} ms"
-                        )
-
-            # -----------------------------------------------
-            # Qdrant
-            # -----------------------------------------------
-
-            if not item.get("qdrant_done"):
-
-                if check_qdrant(
-                    user_id,
-                    expected_updated_at,
-                ):
-
-                    latency_ms = elapsed * 1000
-
-                    with state.lock:
-
-                        state.qdrant_replication_ms.append(
-                            latency_ms
-                        )
-
-                        state.pending[user_id][
-                            "qdrant_done"
-                        ] = True
-
-                        print(
-                            f"[Qdrant] "
+                            f"[MySQL dest] "
                             f"user={user_id} "
                             f"replication={latency_ms:.2f} ms"
                         )
@@ -686,13 +575,12 @@ def run_verifier():
                 if not item:
                     continue
 
-                if (
-                    item.get("opensearch_done")
-                    and item.get("qdrant_done")
-                ):
+                if item.get("dest_done"):
                     del state.pending[user_id]
 
         time.sleep(POLL_INTERVAL_SECONDS)
+
+    connection.close()
 
     print("Replication verifier stopped")
 
@@ -785,18 +673,13 @@ def print_final_report(target_rate, dispatched, duration):
         )
 
     print_report(
-        "PostgreSQL write latency",
+        "MySQL source write latency",
         state.db_latencies_ms,
     )
 
     print_report(
-        "PostgreSQL -> OpenSearch replication latency",
-        state.opensearch_replication_ms,
-    )
-
-    print_report(
-        "PostgreSQL -> Qdrant replication latency",
-        state.qdrant_replication_ms,
+        "MySQL source -> MySQL dest replication latency",
+        state.dest_replication_ms,
     )
 
     print()
@@ -810,7 +693,7 @@ def print_final_report(target_rate, dispatched, duration):
     print("=" * 65)
 
     print_report(
-        "Postgres commit -> Debezium capture",
+        "MySQL source commit -> Debezium capture",
         state.db_to_debezium_ms,
     )
 
@@ -820,23 +703,8 @@ def print_final_report(target_rate, dispatched, duration):
     )
 
     print_report(
-        "OpenSearch: network overhead",
-        state.opensearch_network_ms,
-    )
-
-    print_report(
-        "OpenSearch: server-side indexing (took)",
-        state.opensearch_server_ms,
-    )
-
-    print_report(
-        "Qdrant: network overhead",
-        state.qdrant_network_ms,
-    )
-
-    print_report(
-        "Qdrant: server-side embed + HNSW (time)",
-        state.qdrant_server_ms,
+        "MySQL dest: upsert (network + server)",
+        state.mysql_total_ms,
     )
 
     print()
@@ -844,14 +712,8 @@ def print_final_report(target_rate, dispatched, duration):
     print("--------------------")
 
     print(
-        f"OpenSearch observed: "
-        f"{len(state.opensearch_replication_ms):,} / "
-        f"{state.total_updates:,}"
-    )
-
-    print(
-        f"Qdrant observed:     "
-        f"{len(state.qdrant_replication_ms):,} / "
+        f"MySQL dest observed: "
+        f"{len(state.dest_replication_ms):,} / "
         f"{state.total_updates:,}"
     )
 

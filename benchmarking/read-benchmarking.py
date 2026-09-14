@@ -39,8 +39,7 @@ def parse_args():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark hybrid BM25 + semantic search "
-            "using weighted RRF."
+            "Benchmark MySQL FULLTEXT search."
         )
     )
 
@@ -236,22 +235,18 @@ def run_benchmark(
     # --------------------------------------------------------
     # Measurement state
     #
-    # opensearch/qdrant clients in search/query.py are
-    # connection-pooled HTTP clients, safe to call concurrently
-    # from multiple worker threads - unlike write-benchmarking.py's
-    # psycopg2 connections, no per-thread setup is needed here.
-    # These lists are now appended to from worker threads though,
-    # so every access is guarded by state_lock.
+    # search/query.py keeps one PyMySQL connection per worker
+    # thread (thread-local), safe to call concurrently - like
+    # write-benchmarking.py's per-thread connections, no extra
+    # setup is needed here. These lists are appended to from
+    # worker threads though, so every access is guarded by
+    # state_lock.
     # --------------------------------------------------------
 
     state_lock = threading.Lock()
 
-    bm25_latencies = []
-    semantic_latencies = []
-    rrf_latencies = []
+    fulltext_latencies = []
     total_latencies = []
-
-    overlap_percentages = []
 
     errors = 0
 
@@ -270,10 +265,7 @@ def run_benchmark(
         f"Queries:     {len(queries)}"
     )
     print(
-        "Retrieval:   BM25 top-50 + semantic top-50"
-    )
-    print(
-        "Fusion:      weighted RRF 0.6 / 0.4"
+        "Retrieval:   MySQL FULLTEXT (natural language)"
     )
     print()
 
@@ -290,14 +282,10 @@ def run_benchmark(
         query_text, result_dict = result
 
         latency = result_dict["latency"]
-        overlap = result_dict["overlap"]
 
         with state_lock:
-            bm25_latencies.append(latency["bm25_ms"])
-            semantic_latencies.append(latency["semantic_ms"])
-            rrf_latencies.append(latency["rrf_ms"])
+            fulltext_latencies.append(latency["bm25_ms"])
             total_latencies.append(latency["total_ms"])
-            overlap_percentages.append(overlap["percentage"])
 
     def _on_error(exc):
         nonlocal errors
@@ -323,11 +311,8 @@ def run_benchmark(
         "dispatched": dispatched,
         "queries": len(total_latencies),
         "errors": errors,
-        "bm25": bm25_latencies,
-        "semantic": semantic_latencies,
-        "rrf": rrf_latencies,
+        "fulltext": fulltext_latencies,
         "total": total_latencies,
-        "overlap": overlap_percentages,
     }
 
 
@@ -359,7 +344,7 @@ def print_report(
 
     print()
     print("=" * 70)
-    print("READ / HYBRID SEARCH BENCHMARK")
+    print("READ / FULLTEXT SEARCH BENCHMARK")
     print("=" * 70)
 
     print(
@@ -392,28 +377,13 @@ def print_report(
         )
 
     print_metric(
-        "OpenSearch / BM25 latency",
-        result["bm25"],
+        "MySQL FULLTEXT latency",
+        result["fulltext"],
     )
 
     print_metric(
-        "Qdrant / semantic latency",
-        result["semantic"],
-    )
-
-    print_metric(
-        "RRF computation latency",
-        result["rrf"],
-    )
-
-    print_metric(
-        "End-to-end hybrid latency",
+        "End-to-end query latency",
         result["total"],
-    )
-
-    print_metric(
-        "BM25 / semantic top-50 overlap",
-        result["overlap"],
     )
 
     print()

@@ -2,81 +2,96 @@
 
 ## Overview
 
-This repo demonstrates near-real-time indexing from an OLTP database into two
-different search backends — a lexical/BM25 index (OpenSearch) and a semantic
-vector index (Qdrant) — via change data capture (CDC), instead of periodic
-batch reindexing. A hybrid search layer queries both and fuses the results.
+This repo demonstrates near-real-time replication from a MySQL 8.0 OLTP
+database into a separate MySQL 8.0 destination via change data capture
+(CDC), instead of periodic batch reindexing. The destination table carries
+a FULLTEXT index, and a query layer serves natural-language searches from it.
 
-Every change to Postgres's `users` table (insert, update, delete) is captured
-by Debezium, streamed through Kafka, and applied to both OpenSearch and
-Qdrant by a Python consumer — typically within one to a few seconds of the
-original commit.
+Every change to the source `users` table (insert, update, delete) is captured
+from the MySQL binlog by Debezium, streamed through Kafka, and upserted into
+the destination by a Python consumer — typically within one to a few seconds
+of the original commit.
 
 ## Data flow
 
 ```mermaid
 flowchart LR
-    PG[(PostgreSQL<br/>users table)] -->|WAL| DBZ[Debezium]
-    DBZ -->|CDC events| KAFKA[Kafka topic<br/>usersdb.public.users<br/>3 partitions]
+    SRC[(MySQL 8.0 source<br/>usersdb.users)] -->|binlog| DBZ[Debezium<br/>MySqlConnector]
+    DBZ -->|CDC events| KAFKA[Kafka topic<br/>usersdb.usersdb.users<br/>3 partitions]
     KAFKA --> CONSUMER[Python consumer<br/>consumer/index_users.py]
-    CONSUMER --> OS[(OpenSearch<br/>BM25 index)]
-    CONSUMER --> QD[(Qdrant<br/>vector index)]
+    CONSUMER --> DEST[(MySQL 8.0 destination<br/>searchdb.users<br/>FULLTEXT index)]
 
-    QUERY[search/query.py<br/>hybrid search] --> OS
-    QUERY --> QD
+    QUERY[search/query.py<br/>FULLTEXT search] --> DEST
 ```
 
-### PostgreSQL
+### MySQL source (`mysql-source`)
 
-The `users` table has **no database trigger**. `updated_at` is set explicitly
-by whatever writes to the row (see `benchmarking/write-benchmarking.py`'s
-`perform_update`, which does `updated_at = NOW()` in the `UPDATE` statement
-itself). This is called out deliberately: an earlier version of the
-benchmarking tooling assumed a trigger existed, which made the replication
-checks pass or fail based on stale pre-existing timestamps rather than real
-CDC latency.
+`mysql:8.0` container (host port 3306) running with row-based binlogging
+(`--log-bin --binlog_format=ROW --binlog_row_image=FULL`), which the
+Debezium MySQL connector requires. Init SQL
+(`kafka/mysql/source-init/01-init.sql`) creates `usersdb.users` (columns
+mirror `data/jobseekers_10000.csv`, `DATETIME(6)` timestamps) plus two
+users: `debezium` (replication privileges) and `writer` (SELECT/UPDATE on
+`users`, used by the write benchmark).
+
+The `users` table has **no database trigger**. `updated_at` is set
+explicitly by whatever writes to the row (see
+`benchmarking/write-benchmarking.py`'s `perform_update`, which does
+`updated_at = NOW(6)` in the `UPDATE` statement itself, then reads the
+committed value back with a follow-up `SELECT` — MySQL 8.0 has no
+`RETURNING` clause). This is called out deliberately: an earlier version
+of the benchmarking tooling assumed a trigger existed, which made the
+replication checks pass or fail based on stale pre-existing timestamps
+rather than real CDC latency.
 
 ### Debezium
 
-Captures the Postgres write-ahead log and publishes change events to Kafka.
-Configuration: `connector/users-connector.json` (snapshot mode `initial`,
-logical replication slot/publication, no schema-history side effects beyond
-the internal Connect topics).
+Reads the source's binlog and publishes change events to Kafka.
+Configuration: `kafka/connector/users-connector.json` (`MySqlConnector`,
+snapshot mode `initial` — on a fresh Kafka (no stored offsets) the full
+`users` table is snapshotted as `r` events first, so the destination starts
+as a complete copy; after that only binlog changes stream).
 
 ### Kafka
 
-Topic `usersdb.public.users`, 3 partitions (`kafka/docker-compose.yml`). The
-broker exposes two listeners: an internal one (`kafka:9092`) for other
+Topic `usersdb.usersdb.users`, 3 partitions (`kafka/docker-compose.yml`).
+The broker exposes two listeners: an internal one (`kafka:9092`) for other
 containers on the same Docker network (Debezium uses this), and an external
-one (`kafka:9094` at boot, reachable as `localhost:9094`) for clients running
-on the host machine, which can't resolve the `kafka` hostname otherwise.
+one (`localhost:9094`) for clients running on the host machine, which can't
+resolve the `kafka` hostname otherwise.
 
 ### Consumer (`consumer/index_users.py`)
 
-Reads Debezium events and applies them to both search backends:
+Reads Debezium events and applies them to the destination MySQL:
 
 - **At-least-once processing**: the Kafka offset is only committed after
-  both the OpenSearch and Qdrant writes for a message succeed. Any exception
-  aborts the process without committing, so the message is redelivered after
-  restart. Both writes are idempotent upserts, so redelivery is safe.
-- **Concurrent writes**: OpenSearch and Qdrant are independent of each other,
-  so each message's two writes run concurrently (a small thread pool), not
-  sequentially.
+  the destination write for a message succeeds. Any exception aborts the
+  process without committing, so the message is redelivered after restart.
+  The write is an idempotent `INSERT ... ON DUPLICATE KEY UPDATE`
+  (or `DELETE`), so redelivery is safe.
 - **Stage-latency telemetry**: each processed message appends one JSON line
   to `logs/cdc_timings.jsonl` (path configurable via `CDC_TIMINGS_LOG`),
-  recording Postgres→Debezium capture time, Debezium→consumer delivery time,
-  and OpenSearch/Qdrant network vs. server-side time each. The write
-  benchmark reads this log back to build its stage-by-stage report.
+  recording source→Debezium capture time, Debezium→consumer delivery time,
+  and the destination upsert time. The write benchmark reads this log back
+  to build its stage-by-stage report.
 - **Horizontal scaling**: `run/consumer.sh --instances N` runs N processes in
   the same Kafka consumer group; Kafka's own group-rebalancing protocol
   splits the topic's partitions across them automatically, with no code
   changes needed. The natural ceiling is the partition count (3 today).
 
+### MySQL destination (`mysql-dest`)
+
+`mysql:8.0` container (host port 3307). Init SQL
+(`kafka/mysql/dest-init/01-init.sql`) creates `searchdb.users` with a
+FULLTEXT index over `job_title, skills, bio, company, location`, plus the
+`consumer` user (SELECT/INSERT/UPDATE/DELETE on `searchdb.*`).
+
 ### Search layer (`search/query.py`)
 
-Hybrid retrieval: BM25 (OpenSearch, top 50) and semantic search (Qdrant,
-top 50, embeddings generated server-side), fused via weighted Reciprocal
-Rank Fusion (BM25 weight 0.6, semantic weight 0.4, `k=60`) down to a top 10.
+FULLTEXT retrieval: `MATCH(job_title, skills, bio, company, location)
+AGAINST (... IN NATURAL LANGUAGE MODE)`, top 10 by relevance score.
+Each worker thread gets its own PyMySQL connection (thread-local), so the
+read benchmark can query concurrently.
 
 ### Benchmarking (`benchmarking/`)
 
@@ -87,47 +102,40 @@ Rank Fusion (BM25 weight 0.6, semantic weight 0.4, `k=60`) down to a top 10.
   only after the previous one finished), which silently capped the
   achievable rate at roughly `1 / average call latency` regardless of what
   rate was requested.
-- `write-benchmarking.py` — generates Postgres `UPDATE` load at a target
-  rate/concurrency and reports write latency, CDC replication latency, and
-  the consumer's stage-by-stage breakdown.
-- `read-benchmarking.py` — generates hybrid-search query load and reports
-  BM25/semantic/RRF/end-to-end latency.
+- `write-benchmarking.py` — generates MySQL `UPDATE` load against the
+  source at a target rate/concurrency and reports write latency, CDC
+  replication latency (polled against the destination), and the consumer's
+  stage-by-stage breakdown.
+- `read-benchmarking.py` — generates FULLTEXT query load and reports
+  FULLTEXT/end-to-end latency.
 
-## Known limitations / load-tested findings
+## Differences from the original PostgreSQL pipeline
 
-These were found by actually load-testing the pipeline, not just reasoning
-about the code. Recorded here so they don't need rediscovering:
+- Source: PostgreSQL WAL → **MySQL 8.0 binlog** (`MySqlConnector`).
+- Destinations: OpenSearch (BM25) + Qdrant (vector) → **a single MySQL 8.0
+  table with a FULLTEXT index**. MySQL 8.0 has no native vector type
+  (arrived in MySQL 9.0), so the semantic leg was dropped rather than
+  emulated.
+- Query layer: hybrid BM25 + semantic with weighted RRF → **FULLTEXT
+  natural-language search**; the RRF fusion stage is gone.
 
-- **`search/query.py`'s `query()` calls OpenSearch then Qdrant sequentially**,
-  not concurrently. This inflates each query's own latency (roughly by
-  however long the second call takes) and, under load-testing, understates
-  how much concurrent pressure is actually reaching OpenSearch — a slow
-  first call holds a worker/concurrency slot for longer than necessary,
-  reducing the true dispatch rate at a given `--concurrency`. Diagnosed this
-  session; not yet fixed.
-- **OpenSearch has a low concurrent-query ceiling on this deployment** — real
-  read timeouts were observed above roughly 20 concurrent BM25 queries, with
-  latency degrading sharply past that point (see `docs/read-benchmarking.md`).
-  This is a cluster-sizing/capacity decision, not a code defect.
-- **The consumer's per-instance throughput ceiling is roughly 1-3 updates/sec.**
-  Sustained write load much above `~3 × instance count` builds a real,
-  measurable backlog in Kafka (demonstrated at 100 updates/sec against 3
-  consumer instances — see `docs/write-benchmark.md`).
-- **No retry/backoff in the consumer.** A transient network error (e.g. one
-  OpenSearch read timeout) crashes the entire process; it needs a manual
+## Known limitations
+
+- **No retry/backoff in the consumer.** A transient error (e.g. the
+  destination restarting) crashes the entire process; it needs a manual
   restart rather than recovering on its own.
-- **A small clock skew exists between the Debezium container and the
-  Postgres host** (order of a few hundred milliseconds), which occasionally
-  shows up as a negative "Postgres commit → Debezium capture" stage value.
+- **A small clock skew can exist between the Debezium container and the
+  MySQL source** (order of a few hundred milliseconds), which occasionally
+  shows up as a negative "source commit → Debezium capture" stage value.
   It's a measurement quirk in that one stage, not a sign of incorrect
   replication.
+- FULLTEXT natural-language mode ignores rows matching >50% of the table
+  (the classic MySQL fulltext threshold) and has a minimum word length of
+  3 by default (`innodb_ft_min_token_size`) — short tokens in queries
+  silently don't match.
 
 ## Benchmark reports
 
-- `docs/write-benchmark.md` — write/CDC path at 100 updates/sec for 5
-  minutes: the writer hit its target rate almost exactly (dispatch is no
-  longer the bottleneck), while the CDC pipeline's own throughput ceiling
-  produced a large, honestly-reported backlog.
-- `docs/read-benchmarking.md` — hybrid search at a requested 100 queries/sec:
-  surfaced OpenSearch's concurrent-query ceiling directly (timeouts and
-  latency blowing out well before 100 qps was reached).
+The reports under `docs/` (`write-benchmark.md`, `read-benchmarking.md`)
+were captured against the original PostgreSQL → OpenSearch/Qdrant pipeline
+and are kept for history; rerun the benchmarks to produce MySQL numbers.

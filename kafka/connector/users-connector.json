@@ -1,26 +1,21 @@
 {
   "name": "users-cdc",
   "config": {
-    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "connector.class": "io.debezium.connector.mysql.MySqlConnector",
 
-    "database.hostname": "",
-    "database.port": "5432",
-    "database.user": "",
-    "database.password": "",
-    "database.dbname": "",
-    "database.sslmode": "require",
+    "database.hostname": "mysql-source",
+    "database.port": "3306",
+    "database.user": "debezium",
+    "database.password": "debezium",
+
+    "database.server.id": "1",
 
     "topic.prefix": "usersdb",
 
-    "plugin.name": "pgoutput",
+    "database.include.list": "usersdb",
+    "table.include.list": "usersdb.users",
 
-    "slot.name": "users_cdc_slot",
-    "publication.name": "users_cdc",
-    "publication.autocreate.mode": "disabled",
-
-    "table.include.list": "public.users",
-
-    "snapshot.mode": "no_data",
+    "snapshot.mode": "initial",
 
     "tombstones.on.delete": "false",
 

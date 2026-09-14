@@ -31,25 +31,29 @@ pip install -r requirements.txt
 if [ ! -f ".env" ]; then
     echo "Creating .env template ..."
     cat > .env <<'EOF'
-# OpenSearch
-OPENSEARCH_HOST=
-OPENSEARCH_USERNAME=
-OPENSEARCH_PASSWORD=
+# MySQL source (usersdb on mysql-source, host port 3306) - the write
+# benchmark's user (SELECT/UPDATE on users only)
+MYSQL_SOURCE_HOST=localhost
+MYSQL_SOURCE_PORT=3306
+MYSQL_SOURCE_DB=usersdb
+MYSQL_SOURCE_USER=writer
+MYSQL_SOURCE_PASSWORD=writerpass
 
-# Qdrant
-QDRANT_URL=
-QDRANT_API_KEY=
+# MySQL source admin - only needed by scripts/seed_source.py
+MYSQL_SOURCE_ADMIN_USER=root
+MYSQL_SOURCE_ADMIN_PASSWORD=rootpassword
 
-# PostgreSQL (only needed for benchmarking/write-benchmarking.py)
-PGHOST=
-PGPORT=5432
-PGDATABASE=
-PGUSER=
-PGPASSWORD=
+# MySQL destination (searchdb on mysql-dest, host port 3307) - used
+# by consumer/index_users.py and search/query.py
+MYSQL_DEST_HOST=localhost
+MYSQL_DEST_PORT=3307
+MYSQL_DEST_DB=searchdb
+MYSQL_DEST_USER=consumer
+MYSQL_DEST_PASSWORD=consumerpass
 
 # Kafka (defaults match kafka/docker-compose.yml; override if different)
-KAFKA_BOOTSTRAP_SERVERS=localhost:9092
-KAFKA_TOPIC=usersdb.public.users
+KAFKA_BOOTSTRAP_SERVERS=localhost:9094
+KAFKA_TOPIC=usersdb.usersdb.users
 KAFKA_GROUP_ID=users-indexer
 
 # Shared stage-latency log: consumer/index_users.py appends to it,

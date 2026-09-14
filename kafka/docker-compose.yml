@@ -1,8 +1,71 @@
 services:
 
+  # CDC source: MySQL 8.0 with row-based binlog enabled (required by
+  # the Debezium MySQL connector).
+  mysql-source:
+    image: mysql:8.0
+    container_name: cdc-mysql-source
+    hostname: mysql-source
+
+    command:
+      - --server-id=1
+      - --log-bin=mysql-bin
+      - --binlog_format=ROW
+      - --binlog_row_image=FULL
+      - --gtid_mode=ON
+      - --enforce_gtid_consistency=ON
+
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+
+    ports:
+      - "3306:3306"
+
+    volumes:
+      - mysql-source-data:/var/lib/mysql
+      # *.sql here runs once, on first container initialisation.
+      - ./mysql/source-init:/docker-entrypoint-initdb.d:ro
+
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-prootpassword"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+    networks:
+      - cdc
+
+
+  # CDC destination: MySQL 8.0 with a FULLTEXT index on the users
+  # table (the replacement for OpenSearch + Qdrant).
+  mysql-dest:
+    image: mysql:8.0
+    container_name: cdc-mysql-dest
+    hostname: mysql-dest
+
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+
+    ports:
+      - "3307:3306"
+
+    volumes:
+      - mysql-dest-data:/var/lib/mysql
+      - ./mysql/dest-init:/docker-entrypoint-initdb.d:ro
+
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-prootpassword"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+    networks:
+      - cdc
+
+
   kafka:
     image: apache/kafka:4.0.0
-    container_name: kafka
+    container_name: cdc-kafka
     hostname: kafka
 
     ports:
@@ -43,11 +106,16 @@ services:
 
   debezium:
     image: quay.io/debezium/connect:3.3
-    container_name: debezium
+    container_name: cdc-debezium
     hostname: debezium
 
     depends_on:
-      - kafka
+      kafka:
+        condition: service_started
+      # The connector can't even start capturing until the source
+      # MySQL is accepting connections and its binlog exists.
+      mysql-source:
+        condition: service_healthy
 
     ports:
       - "8083:8083"
@@ -83,6 +151,8 @@ services:
 
 volumes:
   kafka-data:
+  mysql-source-data:
+  mysql-dest-data:
 
 networks:
   cdc:

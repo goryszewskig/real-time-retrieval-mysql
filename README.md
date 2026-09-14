@@ -1,18 +1,22 @@
-# CDC-driven hybrid search demo
+# CDC-driven FULLTEXT search demo (MySQL variant)
 
-A demo pipeline showing near-real-time indexing from PostgreSQL into
-OpenSearch (lexical/BM25) and Qdrant (semantic/vector) via Debezium + Kafka,
-with a hybrid-search query layer and load-testing tools for both the
+> This is the MySQL variant of the original PostgreSQL → OpenSearch/Qdrant
+> pipeline ([real-time-retrieval](https://github.com/goryszewskig/real-time-retrieval)).
+> Source and destination are both MySQL 8.0.
+
+A demo pipeline showing near-real-time replication from a MySQL 8.0 source
+database into a separate MySQL 8.0 destination database via Debezium + Kafka,
+with a FULLTEXT search query layer and load-testing tools for both the
 write/CDC path and the read/search path. See [docs/architecture.md](docs/architecture.md)
 for the full design and load-tested findings.
 
 ## Prerequisites
 
-- Docker (for Kafka + Debezium)
+- Docker (for Kafka + Debezium + both MySQL 8.0 instances)
 - Python 3
-- An OpenSearch domain
-- A Qdrant instance (Cloud or self-hosted)
-- A PostgreSQL database with logical replication enabled
+
+Everything else runs locally in docker-compose: no external databases,
+search engines, or cloud services are needed.
 
 ## Setup
 
@@ -23,50 +27,59 @@ for the full design and load-tested findings.
    bash setup.sh
    ```
 
-2. **Fill in `.env`** with real credentials (never commit real values):
+2. **Fill in `.env`** — the scaffolded defaults already match the
+   docker-compose services, so this works out of the box unless you
+   changed credentials:
 
    | Variable | Purpose |
    |---|---|
-   | `OPENSEARCH_HOST`, `OPENSEARCH_USERNAME`, `OPENSEARCH_PASSWORD` | OpenSearch domain |
-   | `QDRANT_URL`, `QDRANT_API_KEY` | Qdrant instance |
-   | `PGHOST`, `PGPORT`, `PGDATABASE` | PostgreSQL connection |
-   | `PGUSER`, `PGPASSWORD` | Debezium's replication role (read-only) |
-   | `PGWRITEUSER`, `PGWRITEPASSWORD` | A separate role with `UPDATE` on `users`, used only by the write benchmark |
+   | `MYSQL_SOURCE_HOST`, `MYSQL_SOURCE_PORT`, `MYSQL_SOURCE_DB` | Source MySQL (usersdb, default `localhost:3306`) |
+   | `MYSQL_SOURCE_USER`, `MYSQL_SOURCE_PASSWORD` | Role with `UPDATE` on `users`, used only by the write benchmark |
+   | `MYSQL_SOURCE_ADMIN_USER`, `MYSQL_SOURCE_ADMIN_PASSWORD` | Admin role, used only by the seed script |
+   | `MYSQL_DEST_HOST`, `MYSQL_DEST_PORT`, `MYSQL_DEST_DB` | Destination MySQL (searchdb, default `localhost:3307`) |
+   | `MYSQL_DEST_USER`, `MYSQL_DEST_PASSWORD` | Consumer/query role |
    | `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_TOPIC`, `KAFKA_GROUP_ID` | Kafka connection |
    | `CDC_TIMINGS_LOG` | Path to the consumer's stage-latency log (default `logs/cdc_timings.jsonl`) |
 
-3. **Start Kafka + Debezium**:
+3. **Start Kafka, Debezium, and both MySQL instances**:
 
    ```bash
    docker compose -f kafka/docker-compose.yml up -d
    ```
 
-4. **Register the Debezium connector**:
+   On first start, MySQL runs the init SQL in `kafka/mysql/source-init/`
+   and `kafka/mysql/dest-init/` (creates the databases, tables, FULLTEXT
+   index, and users).
+
+4. **Seed the source database**:
+
+   ```bash
+   python scripts/seed_source.py
+   ```
+
+5. **Register the Debezium connector**:
 
    ```bash
    curl -X POST -H "Content-Type: application/json" \
-     --data @connector/users-connector.json \
+     --data @kafka/connector/users-connector.json \
      http://localhost:8083/connectors
    ```
 
-5. **Run the consumer**:
+6. **Run the consumer**:
 
    ```bash
    bash run/consumer.sh                  # single instance
    bash run/consumer.sh --instances 3    # one per Kafka partition
    ```
 
-6. **Run the benchmarks**:
+7. **Run the benchmarks**:
 
    ```bash
    bash run/write-benchmarking.sh --rate 10 --duration 60 --concurrency 20
    bash run/read-benchmarking.sh  --rate 10 --duration 60 --concurrency 20
    ```
 
-   See `docs/write-benchmark.md` and `docs/read-benchmarking.md` for example
-   reports (100 updates/sec and 100 queries/sec runs).
-
-7. **Try an ad-hoc hybrid search**:
+8. **Try an ad-hoc FULLTEXT search**:
 
    ```bash
    python search/query.py "backend engineer kafka"
