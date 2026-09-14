@@ -68,17 +68,15 @@ def create_mysql_connection():
 mysql_conn = create_mysql_connection()
 
 
-def get_connection():
-    """Return a live connection, reconnecting if it dropped."""
-
+def reconnect():
     global mysql_conn
 
     try:
-        mysql_conn.ping()
+        mysql_conn.close()
     except Exception:
-        mysql_conn = create_mysql_connection()
+        pass
 
-    return mysql_conn
+    mysql_conn = create_mysql_connection()
 
 
 # ============================================================
@@ -177,16 +175,17 @@ def index_mysql(user):
 
     total_start = time.perf_counter()
 
-    connection = get_connection()
+    try:
+        with mysql_conn.cursor() as cursor:
+            cursor.execute(UPSERT_SQL, row)
+    except pymysql.OperationalError:
+        # Dropped connection - reconnect once and retry.
+        reconnect()
 
-    with connection.cursor() as cursor:
-        cursor.execute(UPSERT_SQL, row)
+        with mysql_conn.cursor() as cursor:
+            cursor.execute(UPSERT_SQL, row)
 
     total_ms = (time.perf_counter() - total_start) * 1000
-
-    print(
-        f"[MySQL] upserted user={document_id}"
-    )
 
     return {
         "total_ms": total_ms,
@@ -221,13 +220,20 @@ def delete_user(user_id):
     Delete the user from the destination table.
     """
 
-    connection = get_connection()
+    try:
+        with mysql_conn.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM users WHERE id = %s",
+                (user_id,),
+            )
+    except pymysql.OperationalError:
+        reconnect()
 
-    with connection.cursor() as cursor:
-        cursor.execute(
-            "DELETE FROM users WHERE id = %s",
-            (user_id,),
-        )
+        with mysql_conn.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM users WHERE id = %s",
+                (user_id,),
+            )
 
     print(
         f"[DELETE] user={user_id}"
@@ -278,7 +284,6 @@ def process_event(event):
     )
 
     operation = payload.get("op")
-    print(operation)
 
     if operation in ("c", "u", "r"):
         user = payload.get("after")
@@ -333,17 +338,10 @@ def main():
         f"{KAFKA_TOPIC}"
     )
 
+    processed = 0
+    started_at = time.perf_counter()
+
     for message in consumer:
-
-        print(
-            "\n--------------------------------------------------"
-        )
-
-        print(
-            f"[{CONSUMER_INSTANCE_ID}] Kafka "
-            f"partition={message.partition} "
-            f"offset={message.offset}"
-        )
 
         try:
 
@@ -351,13 +349,26 @@ def main():
 
             process_event(event)
 
-            # Commit ONLY after the destination write succeeded.
-            consumer.commit()
+            # Commit only AFTER the destination write succeeded.
+            # Async: a synchronous commit per message costs a broker
+            # round trip and was the main throughput bottleneck
+            # (~25 ms/message). At-least-once is preserved: if the
+            # process dies before the async commit lands, the
+            # messages are simply redelivered, and the idempotent
+            # upsert makes that safe.
+            consumer.commit_async()
 
-            print(
-                f"[{CONSUMER_INSTANCE_ID}] [Kafka] "
-                f"committed offset={message.offset}"
-            )
+            processed += 1
+
+            if processed % 500 == 0:
+                rate = processed / (
+                    time.perf_counter() - started_at
+                )
+                print(
+                    f"[{CONSUMER_INSTANCE_ID}] processed "
+                    f"{processed:,} messages "
+                    f"({rate:.0f} msg/sec)"
+                )
 
         except Exception as exc:
 
