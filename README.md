@@ -84,3 +84,104 @@ search engines, or cloud services are needed.
    ```bash
    python search/query.py "backend engineer kafka"
    ```
+
+## Operating Kafka (DevOps guide)
+
+Everything below uses the compose stack's real names: broker container
+`cdc-kafka` (bootstrap `localhost:9092` inside the container, `localhost:9094`
+from the host), Connect REST on `http://localhost:8083`, CDC topic
+`usersdb.usersdb.users`, consumer group `users-indexer`.
+
+### Daily health checks
+
+```bash
+# 1. Are all four containers up and healthy?
+docker compose -f kafka/docker-compose.yml ps
+
+# 2. Is the connector running? (state should be RUNNING for connector AND task)
+curl -s http://localhost:8083/connectors/users-cdc/status
+
+# 3. Is the consumer keeping up? (LAG should trend to 0)
+docker exec cdc-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe --group users-indexer
+
+# 4. Broker alive and topics present?
+docker exec cdc-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --list
+```
+
+### Common scenarios
+
+**Watch CDC events live** (debug what Debezium is actually publishing):
+
+```bash
+docker exec -it cdc-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic usersdb.usersdb.users --from-beginning --max-messages 5
+```
+
+**Connector is FAILED or UNASSIGNED** — get the error trace, then restart:
+
+```bash
+curl -s http://localhost:8083/connectors/users-cdc/status | python -m json.tool
+curl -X POST http://localhost:8083/connectors/users-cdc/restart
+```
+
+Typical causes: MySQL source restarted (binlog position moved), wrong
+credentials, or the source wasn't healthy when the connector registered.
+
+**Re-run the initial snapshot** (destination drifted, or you reseeded the
+source). Debezium stores its binlog offset inside Kafka, so the connector
+must be deleted *and* Kafka state wiped, otherwise it resumes where it
+left off and silently skips the snapshot:
+
+```bash
+curl -X DELETE http://localhost:8083/connectors/users-cdc
+docker compose -f kafka/docker-compose.yml stop debezium kafka
+docker rm cdc-kafka cdc-debezium
+docker volume rm kafka_kafka-data
+docker compose -f kafka/docker-compose.yml up -d kafka debezium
+curl -X POST -H "Content-Type: application/json" \
+  --data @kafka/connector/users-connector.json \
+  http://localhost:8083/connectors
+```
+
+Then truncate the destination and restart the consumer (its group offsets
+lived in the wiped Kafka, so it re-reads from `earliest` automatically).
+
+**Scale the consumer** — the topic has 3 partitions, so up to 3 instances
+help; a 4th sits idle:
+
+```bash
+bash run/consumer.sh --instances 3
+```
+
+**Restart order matters**: `mysql-source` → `kafka` → `debezium` → host
+consumer. `docker compose up -d` already enforces the container part via
+`depends_on`/healthchecks; only restart the host consumer last.
+
+### Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `curl :8083/connectors` connection refused | Connect still booting (it takes ~30-60s) | Wait, watch `docker logs -f cdc-debezium` |
+| Connector RUNNING but no events in Kafka | Registered *after* the writes happened, or offsets from a previous life | Re-register with a wiped Kafka (snapshot procedure above) |
+| Consumer: `NoBrokersAvailable` | Host client pointing at `kafka:9092` (unresolvable from host) | Use `localhost:9094` in `KAFKA_BOOTSTRAP_SERVERS` |
+| Consumer lag grows forever | Fewer consumer instances than partitions, or consumer crashed | Check process; scale to `--instances 3`; check `logs/consumer*.log` |
+| Debezium task FAILED with binlog error | `mysql-source` was recreated (`down -v` or new volume) | Wipe Kafka + re-register (offset points at a binlog file that no longer exists) |
+| Destination row count != source | Consumer crashed mid-stream, or manual writes to destination | Restart consumer (at-least-once + idempotent upserts self-heal); re-snapshot if drift is large |
+| Port 3306/3307/8083/9094 already in use | Another local MySQL/Kafka project | `docker ps` to find it; change the host-side port mapping in compose |
+| Container name conflict on `up` | Stale container from another project (`mysql-source`, `debezium`, ...) | Compose uses `cdc-*` names to avoid this; remove/renamed the *other* project's container if you hit it anyway |
+
+### Full teardown / reset
+
+```bash
+# Stop everything, keep data volumes:
+docker compose -f kafka/docker-compose.yml down
+
+# Stop everything AND wipe all data (Kafka, both MySQLs) - clean slate:
+docker compose -f kafka/docker-compose.yml down -v
+```
+
+After `down -v`, follow Setup steps 3-6 again (MySQL init SQL re-runs on
+fresh volumes, then reseed, then re-register the connector).
